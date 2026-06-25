@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server';
-import { getStore } from '@/lib/store';
+import { getSupabase, type SettingsRow } from '@/lib/supabase';
+
+export const dynamic = 'force-dynamic';
 
 function generateTimeSlots(start: string, end: string, interval: number): string[] {
   const slots: string[] = [];
@@ -14,45 +16,65 @@ function generateTimeSlots(start: string, end: string, interval: number): string
   return slots;
 }
 
+const DEFAULT_SETTINGS: SettingsRow = {
+  id: 1,
+  working_days: [1, 2, 3, 4, 5, 6],
+  work_start: '09:00',
+  work_end: '19:00',
+  work_interval: 30,
+};
+
+async function getSettings(): Promise<SettingsRow> {
+  const supabase = getSupabase();
+  const { data } = await supabase.from('settings').select('*').eq('id', 1).single();
+  return (data as SettingsRow) ?? DEFAULT_SETTINGS;
+}
+
 export async function GET(request: Request) {
-  const store = getStore();
   const { searchParams } = new URL(request.url);
   const date = searchParams.get('date');
+  const settings = await getSettings();
 
   if (!date) {
     return NextResponse.json({
-      workingDays: store.workingDays,
-      workingHours: store.workingHours,
+      workingDays: settings.working_days,
+      workingHours: {
+        start: settings.work_start,
+        end: settings.work_end,
+        interval: settings.work_interval,
+      },
     });
   }
 
   const dayOfWeek = new Date(date + 'T00:00:00').getDay();
-  if (!store.workingDays.includes(dayOfWeek)) {
+  if (!settings.working_days.includes(dayOfWeek)) {
     return NextResponse.json({ slots: [], isWorkingDay: false });
   }
 
-  const allSlots = generateTimeSlots(
-    store.workingHours.start,
-    store.workingHours.end,
-    store.workingHours.interval
-  );
+  const supabase = getSupabase();
+  const allSlots = generateTimeSlots(settings.work_start, settings.work_end, settings.work_interval);
 
-  const bookedTimes = store.appointments
-    .filter((a) => a.date === date && a.status !== 'cancelled')
-    .map((a) => a.time);
+  const [{ data: booked }, { data: blocked }] = await Promise.all([
+    supabase.from('appointments').select('time').eq('date', date).neq('status', 'cancelled'),
+    supabase.from('blocked_slots').select('time').eq('date', date),
+  ]);
 
-  const blockedTimes = store.blockedSlots
-    .filter((s) => s.date === date)
-    .map((s) => s.time);
+  const bookedTimes = (booked ?? []).map((r: { time: string }) => r.time);
+  const blockedTimes = (blocked ?? []).map((r: { time: string }) => r.time);
 
   const available = allSlots.filter((s) => !bookedTimes.includes(s) && !blockedTimes.includes(s));
   return NextResponse.json({ slots: available, isWorkingDay: true });
 }
 
 export async function PUT(request: Request) {
-  const store = getStore();
+  const supabase = getSupabase();
   const body = await request.json();
-  if (body.workingDays !== undefined) store.workingDays = body.workingDays;
-  if (body.workingHours !== undefined) store.workingHours = { ...store.workingHours, ...body.workingHours };
+  const update: Partial<SettingsRow> = { id: 1 };
+  if (body.workingDays !== undefined) update.working_days = body.workingDays;
+  if (body.workingHours?.start !== undefined) update.work_start = body.workingHours.start;
+  if (body.workingHours?.end !== undefined) update.work_end = body.workingHours.end;
+  if (body.workingHours?.interval !== undefined) update.work_interval = body.workingHours.interval;
+
+  await supabase.from('settings').upsert(update);
   return NextResponse.json({ success: true });
 }
